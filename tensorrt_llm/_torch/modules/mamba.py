@@ -1,143 +1,18 @@
-from dataclasses import dataclass
 from typing import Optional
 
 import torch
+from causal_conv1d import causal_conv1d_update
+from causal_conv1d.causal_conv1d_varlen import causal_conv1d_varlen_states
+from einops import rearrange, repeat
+from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as RMSNormGated
+from mamba_ssm.ops.triton.selective_state_update import selective_state_update
+from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 from torch import nn
 
 from ..attention_backend import AttentionMetadata
 from ..distributed import ParallelConfig, TensorParallelMode
 from ..model_config import ModelConfig
 from .linear import Linear
-
-
-@dataclass
-class MambaCacheParams:
-    conv_states: torch.Tensor = torch.Tensor()
-    ssm_states: torch.Tensor = torch.Tensor()
-    indices: torch.Tensor = torch.Tensor()
-
-
-class MambaCacheManager:
-
-    def __init__(
-        self,
-        *,
-        d_model: int,
-        d_state: int,
-        d_conv: int,
-        expand: int,
-        n_groups: int,
-        head_dim: int,
-        num_mamba_layers: int,
-        max_batch_size: int,
-        dtype: Optional[torch.dtype] = None,
-        config: Optional[ModelConfig] = None,
-    ):
-
-        config = config or ModelConfig()
-        tp_size = config.mapping.tp_size
-
-        d_inner = d_model * expand
-        conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = d_inner // head_dim
-
-        assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
-        assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-
-        conv_dim = conv_dim // tp_size
-        nheads = nheads // tp_size
-
-        device = torch.device("cuda")
-
-        self.conv_states = torch.empty(
-            size=[num_mamba_layers, max_batch_size, d_conv - 1, conv_dim],
-            dtype=dtype,
-            device=device,
-        )
-
-        self.ssm_states = torch.empty(
-            size=[
-                num_mamba_layers,
-                max_batch_size,
-                nheads,
-                d_state,
-                head_dim,
-            ],
-            dtype=dtype,
-            device=device,
-        )
-
-    def get_params(self, attn_metadata: AttentionMetadata) -> MambaCacheParams:
-        # request_ids is set to None when warming up the engine
-        # we set this warmup request to zero position
-        request_ids = ([0] if attn_metadata.request_ids is None else
-                       attn_metadata.request_ids)
-
-        # this implements the simplest possible mapping, indices = request_ids
-        indices = torch.as_tensor(request_ids, dtype=torch.int32)
-
-        # return cache params
-        return MambaCacheParams(self.conv_states, self.ssm_states, indices)
-
-
-class RMSNormGroup(nn.Module):
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_groups: int,
-        eps: float = 1e-5,
-        dtype: Optional[torch.dtype] = None,
-        config: Optional[ModelConfig] = None,
-    ):
-        super().__init__()
-
-        config = config or ModelConfig()
-        tp_size = config.mapping.tp_size
-        tp_rank = config.mapping.tp_rank
-
-        assert (hidden_size %
-                num_groups == 0), "hidden_size must be divisible by num_groups"
-
-        assert (hidden_size %
-                tp_size == 0), "hidden_size must be divisible by tp_size"
-
-        assert (num_groups %
-                tp_size == 0), "num_groups must be divisible by tp_size"
-
-        tp_hidden_size = hidden_size // tp_size
-        tp_ngroups = num_groups // tp_size
-
-        self.num_groups = tp_ngroups
-        self.group_size = tp_hidden_size // tp_ngroups
-
-        self.weight = nn.Parameter(torch.empty(tp_hidden_size, dtype=dtype))
-        self.variance_epsilon = eps
-        self.tp_size = tp_size
-        self.tp_rank = tp_rank
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-        input_dtype = x.dtype
-        y = x.to(torch.float32)
-
-        # Reshape to [*, num_groups, group_size]
-        orig_shape = y.shape
-        y = y.view(*y.shape[:-1], self.num_groups, self.group_size)
-
-        # Compute variance over the group_size dimension
-        variance = y.pow(2).mean(-1, keepdim=True)
-
-        # Normalize within each group
-        y = y * torch.rsqrt(variance + self.variance_epsilon)
-
-        # Reshape back to original shape
-        y = y.view(*orig_shape)
-
-        # Apply the scaling weight
-        y = self.weight * y.to(input_dtype)
-
-        return y
 
 
 class Mamba2(nn.Module):
@@ -184,6 +59,7 @@ class Mamba2(nn.Module):
         self.layer_idx = layer_idx
         self.d_conv = d_conv
         self.d_state = d_state
+        self.head_dim = head_dim
         self.chunk_size = chunk_size
         self.delta_rank = delta_rank
         self.delta_softplus = delta_softplus
@@ -209,7 +85,8 @@ class Mamba2(nn.Module):
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node),
+                gpus_per_node=gpus_per_node,
+            ),
             quant_config=config.get_quant_config(),
         )
 
@@ -223,7 +100,8 @@ class Mamba2(nn.Module):
                 tensor_parallel_rank=tp_rank,
                 tensor_parallel_size=tp_size,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
-                gpus_per_node=gpus_per_node),
+                gpus_per_node=gpus_per_node,
+            ),
             quant_config=config.get_quant_config(),
             skip_create_weights=config.skip_create_weights,
         )
@@ -247,30 +125,37 @@ class Mamba2(nn.Module):
                         requires_grad=False))
 
         # norm
-        self.norm = RMSNormGroup(d_inner,
-                                 n_groups,
-                                 eps=rms_norm_eps,
-                                 dtype=dtype,
-                                 config=config)
+        self.norm = RMSNormGated(
+            self.tp_d_inner,
+            eps=rms_norm_eps,
+            norm_before_gate=False,
+            group_size=self.tp_d_inner // self.tp_ngroups,
+            dtype=dtype,
+        )
 
         # out_proj
-        self.out_proj = Linear(d_inner,
-                               d_model,
-                               bias=bias,
-                               dtype=dtype,
-                               parallel_config=ParallelConfig(
-                                   tensor_parallel_rank=tp_rank,
-                                   tensor_parallel_size=tp_size,
-                                   tensor_parallel_mode=TensorParallelMode.ROW,
-                                   gpus_per_node=gpus_per_node),
-                               quant_config=config.get_quant_config())
+        self.out_proj = Linear(
+            d_inner,
+            d_model,
+            bias=bias,
+            dtype=dtype,
+            parallel_config=ParallelConfig(
+                tensor_parallel_rank=tp_rank,
+                tensor_parallel_size=tp_size,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                gpus_per_node=gpus_per_node,
+            ),
+            quant_config=config.get_quant_config(),
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        mamba_cache_params: MambaCacheParams,
     ) -> torch.Tensor:
+
+        # warm up does not prepare resources, there are two warmup requests
+        is_warmup = attn_metadata.kv_cache_manager is None or attn_metadata.request_ids == [0]
 
         # calculate split size
         num_contexts = attn_metadata.num_contexts
@@ -280,12 +165,22 @@ class Mamba2(nn.Module):
         split_gen = sum_seq[-1] - split_ctx
         split_size = [split_ctx, split_gen]
 
-        # make the split
-        split_indices = torch.split(mamba_cache_params.indices,
+        # handle warm up request
+        if is_warmup:
+            state_indices = torch.as_tensor([0], dtype=torch.int32)
+        else:
+            state_indices = attn_metadata.kv_cache_manager.get_state_indices()
+
+        # make split
+        split_indices = torch.split(state_indices,
                                     [num_contexts, num_generations])
+
         split_seq_lens = torch.split(attn_metadata.seq_lens,
                                      [num_contexts, num_generations])
-        split_hidden_states = torch.split(hidden_states, split_size)
+
+        # in_proj
+        zxbcdt = self.in_proj(hidden_states)
+        split_zxbcdt = torch.split(zxbcdt, split_size, dim=0)
 
         # a batch can have either:
         # * only context requests
@@ -307,87 +202,145 @@ class Mamba2(nn.Module):
         out = []
         for req_type in batch:
 
-            # read conv and ssm states
-            split_batch = split_indices[req_type].tolist()
-            conv_states = mamba_cache_params.conv_states[
-                self.layer_idx][split_batch]
-            ssm_states = mamba_cache_params.ssm_states[
-                self.layer_idx][split_batch]
+            # get indices for either prefill or decode
+            indices = split_indices[req_type].to(torch.long).to(
+                torch.device("cuda"))
 
-            # host request types
-            host_request_types = (torch.zeros_like(split_seq_lens[req_type])
-                                  if req_type == 0 else torch.ones_like(
-                                      split_seq_lens[req_type]))
+            if not is_warmup:
+                conv_states = attn_metadata.kv_cache_manager.get_conv_states(
+                    self.layer_idx)
+                ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
+                    self.layer_idx)
 
-            # last token ids
-            last_token_ids = torch.cumsum(split_seq_lens[req_type],
-                                          dim=0,
-                                          dtype=torch.int32).cuda()
-
-            # in_proj
-            zxbcdt = self.in_proj(split_hidden_states[req_type])
-
-            conv_weight = self.conv1d.weight.unsqueeze(1).permute(
-                1, 2, 0).contiguous()
-            xbc, conv_states_out = torch.ops.trtllm.mamba_conv1d(
-                zxbcdt,
-                conv_weight,
-                self.conv1d.bias,
-                conv_states,
-                host_request_types,
-                last_token_ids,
-                split_seq_lens[req_type],
-                self.slot_mapping,
-                self.tp_conv_dim,
-                self.d_conv,
-                self.tp_d_inner,  # pre_stride
-                self.tp_nheads,  # post_stride
-                self.remove_padding,
-                self.apply_silu,
-                self.is_paged_state,
+            z, xbc, dt = torch.split(
+                split_zxbcdt[req_type],
+                [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
+                dim=-1,
             )
 
-            # selective scan
-            y, ssm_states_out = torch.ops.trtllm.selective_scan(
-                xbc,
-                ssm_states,
-                zxbcdt,
-                self.dt_bias,
-                self.A,
-                xbc,
-                self.D,
-                host_request_types,
-                last_token_ids,
-                zxbcdt,
-                split_seq_lens[req_type],
-                self.slot_mapping,
-                self.tp_d_inner,
-                self.d_state,
-                self.tp_nheads,
-                self.tp_ngroups,
-                self.chunk_size,
-                self.delta_rank,
-                self.delta_softplus,
-                self.remove_padding,
-                self.is_mamba2,
-                self.is_paged_state,
-            )
+            # prefill
+            if req_type == 0:
 
-            # group norm
-            y = self.norm(y)
+                cu_seqlens = (torch.cat(
+                    [
+                        torch.zeros(1),
+                        torch.cumsum(split_seq_lens[req_type], dim=0)
+                    ],
+                    dim=0,
+                ).to(torch.int32).to(torch.device("cuda")))
 
-            # out_proj
-            y = self.out_proj(y)
+                conv_states_out = causal_conv1d_varlen_states(
+                    xbc, cu_seqlens, state_len=self.d_conv)
+
+                if not is_warmup:
+                    conv_states.index_copy_(0, indices, conv_states_out)
+
+                # Temporary fix to make mamba layer close to original implementation
+                ctx_seq_lens = split_seq_lens[req_type].tolist()
+                ctx_zxbcdt = torch.split(split_zxbcdt[req_type],
+                                         ctx_seq_lens,
+                                         dim=0)
+                split_y = []
+                split_ssm_states = []
+                for i in range(len(ctx_zxbcdt)):
+                    y, ssm_states_out = mamba_split_conv1d_scan_combined(
+                        ctx_zxbcdt[i].unsqueeze(0),
+                        self.conv1d.weight.permute(0, 1).contiguous(),
+                        self.conv1d.bias,
+                        self.dt_bias,
+                        self.A,
+                        D=self.D,
+                        chunk_size=self.chunk_size,
+                        activation="silu",
+                        headdim=self.head_dim,
+                        ngroups=self.tp_ngroups,
+                        norm_before_gate=False,
+                        initial_states=None,
+                        return_final_states=True,
+                    )
+
+                    split_y.append(y.squeeze(0))
+                    split_ssm_states.append(ssm_states_out)
+
+                y = torch.cat(split_y, dim=0)
+                ssm_states_out = torch.cat(split_ssm_states, dim=0)
+
+                # norm
+                y = self.norm(y)
+
+            # decode
+            else:
+
+                # get conv and ssm states for decode
+                if not is_warmup:
+                    conv_states_in = conv_states[indices]
+                    ssm_states_in = ssm_states[indices]
+
+                # update conv states
+                xbc = causal_conv1d_update(
+                    xbc,
+                    conv_states_in,
+                    self.conv1d.weight.permute(0, 1).contiguous(),
+                    self.conv1d.bias,
+                    "silu",
+                )
+
+                # copy new conv states
+                if not is_warmup:
+                    conv_states.index_copy_(0, indices, conv_states_in)
+
+                x, B, C = torch.split(
+                    xbc,
+                    [
+                        self.tp_d_inner,
+                        self.tp_ngroups * self.d_state,
+                        self.tp_ngroups * self.d_state,
+                    ],
+                    dim=-1,
+                )
+
+                ssm_states_out = ssm_states_in.transpose(2, 3)
+
+                A = repeat(self.A,
+                           "h -> h p n",
+                           p=self.head_dim,
+                           n=self.d_state).to(dtype=torch.float32)
+                dt = repeat(dt, "b h -> b h p", p=self.head_dim)
+                dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
+                D = repeat(self.D, "h -> h p", p=self.head_dim)
+                B = rearrange(B, "b (g n) -> b g n", g=self.tp_ngroups)
+                C = rearrange(C, "b (g n) -> b g n", g=self.tp_ngroups)
+                x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.head_dim)
+
+                y = selective_state_update(
+                    ssm_states_out,
+                    x_reshaped,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    D,
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=self.delta_softplus,
+                )
+
+                y = rearrange(y, "b h p -> b (h p)")
+
+                # gated norm
+                y = self.norm(y, z)
+
+            # copy new ssm states
+            if not is_warmup:
+                ssm_states_out = ssm_states_out.transpose(2, 3)
+                ssm_states.index_copy_(0, indices, ssm_states_out)
 
             # append output
             out.append(y)
 
-            # update conv and ssm states
-            for i, idx in enumerate(split_batch):
-                mamba_cache_params.conv_states[self.layer_idx][idx].copy_(
-                    conv_states_out[i])
-                mamba_cache_params.ssm_states[self.layer_idx][idx].copy_(
-                    ssm_states_out[i])
-
         out = torch.cat(out, dim=0)
+
+        # out_proj
+        out = self.out_proj(out)
+
         return out
