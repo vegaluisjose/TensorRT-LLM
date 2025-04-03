@@ -155,7 +155,9 @@ class Mamba2(nn.Module):
     ) -> torch.Tensor:
 
         # warm up does not prepare resources, there are two warmup requests
-        is_warmup = attn_metadata.kv_cache_manager is None or attn_metadata.request_ids == [0]
+        is_warmup = attn_metadata.kv_cache_manager is None or attn_metadata.request_ids == [
+            0
+        ]
 
         # calculate split size
         num_contexts = attn_metadata.num_contexts

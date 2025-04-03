@@ -1,8 +1,9 @@
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from transformer_engine.pytorch import RMSNorm
 from transformers import AutoConfig, PretrainedConfig
 
 from ..attention_backend import AttentionMetadata
@@ -11,10 +12,9 @@ from ..modules.attention import Attention
 from ..modules.embedding import Embedding
 from ..modules.mamba import Mamba2
 from ..modules.mlp import MLP
-from transformer_engine.pytorch import RMSNorm
+from ..speculative import SpecMetadata
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
-from ..speculative import SpecMetadata
 
 
 def split(x: torch.Tensor,
@@ -217,7 +217,7 @@ class Nemotron5Model(DecoderModel):
 
 @register_auto_model("Nemotron5ForCausalLM")
 class Nemotron5ForCausalLM(DecoderModelForCausalLM[Nemotron5Model,
-                                                     Nemotron5Config]):
+                                                   Nemotron5Config]):
 
     def __init__(
         self,
