@@ -210,6 +210,7 @@ class Nemotron5Model(DecoderModel):
 
         for layer in self.layers:
             hidden_states = layer(hidden_states, attn_metadata)
+
         hidden_states = self.norm_f(hidden_states)
 
         return hidden_states
