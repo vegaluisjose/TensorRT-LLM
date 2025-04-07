@@ -181,7 +181,7 @@ def decode_single_request(request, logits):
     # TODO: enable these lines when log_probs is needed
     # request.log_probs_async = log_probs
     # request.set_cum_log_prob(request.cum_log_probs[0] + log_probs[0].item(), 0)
-    return next_tokens
+    return next_tokens, log_probs
 
 
 class TorchDecoder(Decoder):
@@ -242,10 +242,12 @@ class TorchDecoder(Decoder):
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.tensor],
+                        log_probs_host: torch.tensor,
                         decoder_event: torch.cuda.Event):
         if decoder_event:
             decoder_event.synchronize()
         new_tokens_list = new_tensors_host["new_tokens_host"].tolist()
+        log_probs_list = log_probs_host.tolist()
 
         idx = 0
         beam_idx = 0
@@ -257,6 +259,9 @@ class TorchDecoder(Decoder):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
+                log_prob = request.get_log_probs(beam_idx)
+                log_prob += [log_probs_list[idx]]
+                request.set_log_probs(log_prob, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
             idx += 1
@@ -306,6 +311,9 @@ class TorchDecoder(Decoder):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 new_token = new_tokens_list[idx]
                 num_tokens = request.add_new_token(new_token, beam_idx)
+                log_prob = request.get_log_probs(beam_idx)
+                log_prob += [log_probs_list[idx]]
+                request.set_log_probs(log_prob, beam_idx)
                 self._handle_stop_criteria(request, new_token, num_tokens,
                                            beam_idx)
             idx += 1
@@ -314,29 +322,34 @@ class TorchDecoder(Decoder):
                       model_outputs):
         logits = model_outputs["logits"]
         new_tokens_device_array = []
+        log_probs_device_array = []
 
         idx = 0
 
         for request in scheduled_requests.context_requests:
             token_logits = logits[idx:idx + 1, :]
-            new_token = decode_single_request(request, token_logits)
+            new_token, log_probs = decode_single_request(request, token_logits)
             new_tokens_device_array += [new_token]
+            log_probs_device_array += [log_probs]
             idx += 1
 
         for request in scheduled_requests.generation_requests:
             assert request.py_draft_tokens is None, "Speculative decoding not supported in SeparateDecoder."
             token_logits = logits[idx:idx + 1, :]
-            new_token = decode_single_request(request, token_logits)
+            new_token, log_probs = decode_single_request(request, token_logits)
             new_tokens_device_array += [new_token]
+            log_probs_device_array += [log_probs]
             idx += 1
 
         new_tokens_device = torch.cat(new_tokens_device_array)
+        log_probs_device = torch.cat(log_probs_device_array)
         new_tokens_host = new_tokens_device.to('cpu', non_blocking=True)
+        log_probs_host = log_probs_device.to('cpu', non_blocking=True)
         new_tensors_device = {"new_tokens_device": new_tokens_device}
         new_tensors_host = {"new_tokens_host": new_tokens_host}
         decoder_event = torch.cuda.Event()
         decoder_event.record()
-        return new_tensors_device, new_tensors_host, decoder_event
+        return new_tensors_device, new_tensors_host, log_probs_host, decoder_event
 
     def _batch_decode(self, scheduled_requests: ScheduledRequests,
                       model_outputs):
@@ -354,12 +367,13 @@ class TorchDecoder(Decoder):
         if self.mixed_decoder:
             return self._mixed_decode(scheduled_requests, model_outputs)
         else:
+            assert False, "Batch decoding not supported with log_probs."
             return self._batch_decode(scheduled_requests, model_outputs)
 
     def decode(self, scheduled_requests: ScheduledRequests, model_outputs):
-        _, new_tensors_host, decoder_event = self.decode_async(
+        _, new_tensors_host, log_probs_host, decoder_event = self.decode_async(
             scheduled_requests, model_outputs)
-        self.update_requests(scheduled_requests, new_tensors_host,
+        self.update_requests(scheduled_requests, new_tensors_host, log_probs_host,
                              decoder_event)
 
 

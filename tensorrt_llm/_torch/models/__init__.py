@@ -8,6 +8,7 @@ from .modeling_llava_next import LlavaNextModel
 from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron5 import Nemotron5ForCausalLM
+from .modeling_mamba_hybrid import MambaHybridForCausalLM
 from .modeling_nvsmall import NVSmallForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
@@ -23,6 +24,7 @@ __all__ = [
     "LlamaForCausalLM",
     "LlavaNextModel",
     "Nemotron5ForCausalLM",
+    "MambaHybridForCausalLM",
     "MixtralForCausalLM",
     "NemotronForCausalLM",
     "NVSmallForCausalLM",

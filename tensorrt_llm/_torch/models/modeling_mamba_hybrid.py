@@ -32,15 +32,15 @@ def relu2(x: torch.Tensor) -> torch.Tensor:
     return torch.square(F.relu(x))
 
 
-class Nemotron5Config(PretrainedConfig):
-    model_type = "nemotron5"
+class MambaHybridConfig(PretrainedConfig):
+    model_type = "mamba_hybrid"
 
 
 class MLPLayer(MLP):
 
     def __init__(
         self,
-        model_config: ModelConfig[Nemotron5Config],
+        model_config: ModelConfig[MambaHybridConfig],
         layer_idx: int,
     ):
         config = model_config.pretrained_config
@@ -64,7 +64,7 @@ class TransformerLayer(Attention):
 
     def __init__(
         self,
-        model_config: ModelConfig[Nemotron5Config],
+        model_config: ModelConfig[MambaHybridConfig],
         layer_idx: int,
     ):
         config = model_config.pretrained_config
@@ -95,7 +95,7 @@ class MambaHybridLayer(nn.Module):
 
     def __init__(
         self,
-        model_config: ModelConfig[Nemotron5Config],
+        model_config: ModelConfig[MambaHybridConfig],
         layer_idx: int,
         # M -> MambaLayer
         # - -> MLPLayer
@@ -149,9 +149,9 @@ class MambaHybridLayer(nn.Module):
         return hidden_states
 
 
-class Nemotron5Model(DecoderModel):
+class MambaHybridModel(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[Nemotron5Config]):
+    def __init__(self, model_config: ModelConfig[MambaHybridConfig]):
         super().__init__(model_config)
         config = self.model_config.pretrained_config
 
@@ -216,18 +216,18 @@ class Nemotron5Model(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("Nemotron5ForCausalLM")
-class Nemotron5ForCausalLM(DecoderModelForCausalLM[Nemotron5Model,
-                                                   Nemotron5Config]):
+@register_auto_model("MambaHybridForCausalLM")
+class MambaHybridForCausalLM(DecoderModelForCausalLM[MambaHybridModel,
+                                                   MambaHybridConfig]):
 
     def __init__(
         self,
-        model_config: ModelConfig[Nemotron5Config],
+        model_config: ModelConfig[MambaHybridConfig],
     ):
         if not model_config.mapping.tp_size in [1, 2, 4, 8]:
             raise ValueError("TP has to be either 1, 2, 4 or 8")
         super().__init__(
-            Nemotron5Model(model_config),
+            MambaHybridModel(model_config),
             config=model_config,
             hidden_size=model_config.pretrained_config.hidden_size,
             vocab_size=model_config.pretrained_config.vocab_size,
@@ -321,4 +321,4 @@ class Nemotron5ForCausalLM(DecoderModelForCausalLM[Nemotron5Model,
         super().load_weights(new_weights)
 
 
-AutoConfig.register(Nemotron5Config.model_type, Nemotron5Config)
+AutoConfig.register(MambaHybridConfig.model_type, MambaHybridConfig)

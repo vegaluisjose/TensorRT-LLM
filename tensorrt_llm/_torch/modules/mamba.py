@@ -168,14 +168,10 @@ class Mamba2(nn.Module):
         split_size = [split_ctx, split_gen]
 
         # handle warm up request
-        if is_warmup:
-            state_indices = torch.as_tensor([0], dtype=torch.int32)
-        else:
+        if not is_warmup:
             state_indices = attn_metadata.kv_cache_manager.get_state_indices()
-
-        # make split
-        split_indices = torch.split(state_indices,
-                                    [num_contexts, num_generations])
+            split_indices = torch.split(state_indices,
+                                        [num_contexts, num_generations])
 
         split_seq_lens = torch.split(attn_metadata.seq_lens,
                                      [num_contexts, num_generations])
@@ -204,15 +200,15 @@ class Mamba2(nn.Module):
         out = []
         for req_type in batch:
 
-            # get indices for either prefill or decode
-            indices = split_indices[req_type].to(torch.long).to(
-                torch.device("cuda"))
-
             if not is_warmup:
+                indices = split_indices[req_type].to(torch.long).to(
+                    torch.device("cuda"))
                 conv_states = attn_metadata.kv_cache_manager.get_conv_states(
                     self.layer_idx)
                 ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
                     self.layer_idx)
+            else:
+                indices = None
 
             z, xbc, dt = torch.split(
                 split_zxbcdt[req_type],
