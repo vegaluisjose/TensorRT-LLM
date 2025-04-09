@@ -497,12 +497,25 @@ class DecoderModelForCausalLM(nn.Module,
                 spec_metadata=spec_metadata,
             )
 
-        return self.logits_processor.forward(
+        # return self.logits_processor.forward(
+        #     output,
+        #     self.lm_head,
+        #     attn_metadata,
+        #     return_context_logits,
+        # )
+        # hack to save logits
+        logits = self.logits_processor.forward(
             output,
             self.lm_head,
             attn_metadata,
-            return_context_logits,
+            True,
         )
+        if torch.cuda.current_device() == 0:
+            if attn_metadata.kv_cache_manager is not None:
+                # because we are doing one request at a time, we can save the logits like this
+                if attn_metadata.num_contexts > 0:
+                    torch.save(logits, "trtllm_logits.pth")
+        return logits[-1:]
 
     def load_weights(self, weights: Dict):
         tp_size = self.model_config.mapping.tp_size
